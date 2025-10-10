@@ -1,0 +1,86 @@
+declare query_parameters(lookback:timespan = 45d);
+
+// ----- 1) All runs that accrue compute during lookback period ----
+let all_runs =
+AmlRunStatusChangedEvent
+| where TimeGenerated > ago(lookback)
+| summarize
+    run_start_utc = minif(TimeGenerated, Status == "Running"),
+    run_end_utc   = maxif(TimeGenerated, Status in ("Completed","Failed","Canceled")),
+    Location      = any(Location)
+  by WorkspaceName, RootRunId, RunId, ParentRunId
+| where isnotempty(run_start_utc) and isnotempty(run_end_utc)  // exclude currently running
+| extend run_seconds = tolong(datetime_diff("second", run_end_utc, run_start_utc))
+| extend run_hours   = todouble(run_seconds) / 3600.0
+;
+
+// ----- 2) Map each RunId to its ClusterName (via Job events) -----
+let run_to_cluster =
+AmlComputeJobEvent
+| where TimeGenerated > ago(lookback)
+| extend RunId = tostring(split(JobId, "$")[array_length(split(JobId, "$"))-1]) // last segment
+| summarize ClusterName = any(ClusterName) by RunId // only one cluster per job
+;
+
+// ----- 3) Cluster details (snapshot as of run start) -----
+let cluster_details_asof =
+AmlComputeClusterEvent
+| where TimeGenerated > ago(lookback)
+| project ClusterName, ClusterEventTime = TimeGenerated, VmSize, VmPriority, ClusterSKU = Sku
+;
+
+// ----- 4) Identity of the root run (who submitted the pipeline) -----
+let rootrun_submitter =
+AmlRunStatusChangedEvent
+| where RootRunId == RunId
+| extend _ident = parse_json(Identity)
+| project
+    RootRunId,
+    // Prefer human username; otherwise fall back to service principal / app id / object id
+    Submitter = coalesce(
+        tostring(_ident.UserName),
+        strcat("SP: ", tostring(_ident.PrincipalName)),
+        tostring(_ident.AppId),
+        tostring(_ident.ObjectId),
+        "Unknown"
+    )
+;
+
+// ----- 5) Assemble child runs + cluster + details + submitter -----
+let summarized_runs =
+all_runs
+| join kind=inner run_to_cluster on RunId
+| join kind=leftouter cluster_details_asof on ClusterName
+| where ClusterEventTime <= run_start_utc           // ignore cluster details after job submission
+| summarize arg_max(ClusterEventTime, *) by RunId   // take the most recent cluster details
+| project-away ClusterEventTime
+| join kind=leftouter rootrun_submitter on RootRunId
+;
+
+// ----- 6) Join with pricing (update VmSizes and Prices) -----
+// Ideally you add location for region-specific pricing
+let pricing =
+datatable(VmSize:string, VmPriority:string, PricePerHour:real)
+[
+  "STANDARD_DS2_V2","Dedicated",0.13,
+  "STANDARD_D4_V5","Dedicated",0.18,
+  "STANDARD_D4_V5","LowPriority",0.06,
+  "STANDARD_NC40ADS_H100_V5","Dedicated",8.40,
+  "STANDARD_NC16AS_T4_V3","Dedicated",1.39,
+  "STANDARD_D16DS_V4","Dedicated",1.57,
+  "STANDARD_NC6S_V3","Dedicated",3.79
+];
+
+// ----- 7) Dashboard rollup -----
+summarized_runs
+| join kind=leftouter (pricing) on VmSize, VmPriority
+| extend cost = run_hours * PricePerHour
+| summarize
+    jobs              = count(),
+    total_run_hours   = sum(run_hours),
+    sizes             = make_set(VmSize, 8),
+    priorities        = make_set(VmPriority, 4),
+    first_start_utc   = min(run_start_utc),
+    last_end_utc      = max(run_end_utc)
+    by WorkspaceName, Submitter, RootRunId
+| order by first_start_utc asc

@@ -1,0 +1,81 @@
+declare query_parameters(
+    lookback:timespan = 45d,
+    min_duration_minutes:long = 10,
+    cpu_avg_threshold:double = 0.30,
+    gpu_p90_threshold:double = 0.50,
+    gpu_memory_p90_threshold:double = 0.40
+);
+
+let metrics =
+    AmlComputeCpuGpuUtilization
+    | where TimeGenerated > ago(lookback)
+    | extend util = todouble(Utilization)
+    | summarize
+        avg_util = avg(util),
+        median_util = percentile(util, 50),
+        p90_util = percentile(util, 90),
+        max_util = max(util),
+        exec_start = min(TimeGenerated),
+        exec_finish = max(TimeGenerated)
+        by RunId, DeviceType
+    | where max_util > 0
+    | extend duration_m = datetime_diff('minute', exec_finish, exec_start)
+    | where duration_m > min_duration_minutes
+    | extend device_group = case(
+        DeviceType has "GPU Memory", "GPU Memory",
+        DeviceType has "GPU", "GPU",
+        "CPU"
+    )
+    | extend underutilized_reason = case(
+        device_group == "GPU" and p90_util < gpu_p90_threshold, strcat("GPU p90<", tostring(gpu_p90_threshold)),
+        device_group == "GPU Memory" and p90_util < gpu_memory_p90_threshold, strcat("GPU mem p90<", tostring(gpu_memory_p90_threshold)),
+        device_group == "CPU" and avg_util < cpu_avg_threshold, strcat("CPU avg<", tostring(cpu_avg_threshold)),
+        "" // empty means not flagged
+    )
+    | extend underutilized = underutilized_reason != ""
+;
+
+let run_identity =
+    AmlRunStatusChangedEvent
+    | where TimeGenerated > ago(lookback)
+    | summarize
+        WorkspaceName = any(WorkspaceName),
+        RootRunId = any(RootRunId),
+        IdentitySample = any(Identity)
+      by RunId
+    | extend UserName = tostring(parse_json(IdentitySample).UserName)
+    | project RunId, WorkspaceName, RootRunId, UserName
+;
+
+run_identity
+| join kind=inner metrics on RunId
+| where underutilized
+| order by device_group asc, p90_util asc
+| project
+    WorkspaceName,
+    RootRunId,
+    RunId,
+    UserName,
+    device_group,
+    avg_util,
+    p90_util,
+    max_util,
+    duration_m,
+    exec_start,
+    exec_finish,
+    underutilized,
+    underutilized_reason
+
+
+
+// Underutilized Run Examples:
+
+let runId = "<RUN_ID_HERE>";
+let binSize = 5m; // adjust dynamically based on duration
+AmlComputeCpuGpuUtilization
+| where TimeGenerated > ago(lookback)
+| where RunId == runId
+| where DeviceType != "GPU Memory"
+| extend util = todouble(Utilization)
+| summarize avg_util = avg(util) by bin(TimeGenerated, binSize), DeviceType
+| render timechart
