@@ -1,0 +1,82 @@
+declare query_parameters(
+    lookback:timespan = 45d,
+    min_duration_minutes:long = 10,
+    cpu_avg_threshold:double = 30.,
+    gpu_p90_threshold:double = 40.,
+    gpu_bin_threshold:double = 40.,
+    bin_size:timespan = 5m
+);
+
+let gpu_bin_window_metrics =
+    AmlComputeCpuGpuUtilization
+    | where TimeGenerated > ago(lookback)
+    | where DeviceType == "GPU" 
+    | extend util = todouble(Utilization)
+    | summarize
+        bin_avg_util = avg(util)
+      by RunId, DeviceType, bin_start = bin(TimeGenerated, bin_size)
+    | summarize
+        max_bin_avg_util = max(bin_avg_util),
+        bins_evaluated = count()
+      by RunId, DeviceType;
+
+let metrics =
+    AmlComputeCpuGpuUtilization
+    | where TimeGenerated > ago(lookback)
+    | where DeviceType in ("GPU", "CPU")
+    | extend util = todouble(Utilization)
+    | summarize
+        avg_util = avg(util),
+        median_util = percentile(util, 50),
+        p90_util = percentile(util, 90),
+        max_util = max(util),
+        exec_start = min(TimeGenerated),
+        exec_finish = max(TimeGenerated)
+      by RunId, DeviceType
+    | where max_util > 0
+    | extend duration_m = datetime_diff('minute', exec_finish, exec_start)
+    | where duration_m > min_duration_minutes
+    | extend underutilized_reason = case(
+        DeviceType == "GPU" and p90_util < gpu_p90_threshold, strcat("GPU p90<", tostring(gpu_p90_threshold)),
+        "" // empty means not flagged
+    )
+    | extend underutilized = underutilized_reason != ""
+    | join kind=leftouter gpu_bin_window_metrics on RunId, DeviceType
+    | extend max_bin_avg_util = iff(DeviceType == "GPU", max_bin_avg_util, real(null)),
+             bins_evaluated = iff(DeviceType == "GPU", bins_evaluated, long(null))
+    | extend underutilized_reason = case(
+        DeviceType == "GPU" and max_bin_avg_util < gpu_bin_threshold, "GPU util (max bin avg and p90)",
+        DeviceType == "GPU" and p90_util < gpu_p90_threshold, strcat("GPU p90 util <", tostring(gpu_p90_threshold)),
+        "" // empty means not flagged
+    );
+
+let run_identity =
+    AmlRunStatusChangedEvent
+    | where TimeGenerated > ago(lookback)
+    | summarize
+        WorkspaceName = any(WorkspaceName),
+        RootRunId = any(RootRunId),
+        IdentitySample = any(Identity)
+      by RunId
+    | extend UserName = tostring(parse_json(IdentitySample).UserName)
+    | project RunId, WorkspaceName, RootRunId, UserName;
+
+run_identity
+| join kind=inner metrics on RunId
+| where underutilized
+| order by DeviceType asc, p90_util asc
+| project
+    WorkspaceName,
+    RootRunId,
+    RunId,
+    UserName,
+    DeviceType,
+    avg_util,
+    p90_util,
+    max_util,
+    max_bin_avg_util,
+    bins_evaluated,
+    duration_m,
+    exec_start,
+    exec_finish,
+    underutilized_reason

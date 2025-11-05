@@ -4,10 +4,11 @@ Curated Log Analytics Kusto scripts to: (1) estimate per‑pipeline cost, (2) hi
 
 ## Queries
 
-| File                        | Purpose                                                             |
-| --------------------------- | ------------------------------------------------------------------- |
-| `cost-per-job.kql`          | ⇒ cost per Pipeline / Job (RootRunId) & submitter.                  |
-| `underutilized-compute.kql` | Run‑level CPU / GPU utilization stats ⇒ flags low GPU or CPU usage. |
+| File                                 | Purpose                                                             |
+| ------------------------------------ | ------------------------------------------------------------------- |
+| `cost-per-job.kql`                   | ⇒ cost per Pipeline / Job (RootRunId) & submitter.                  |
+| `underutilized-compute.kql`          | Run‑level CPU / GPU utilization stats ⇒ flags low GPU or CPU usage. |
+| `underutilized-compute-gpu-bins.kql` | GPU underutilization with per-bin ceilings for stricter alerting.   |
 
 ## Quick Tweak Points
 
